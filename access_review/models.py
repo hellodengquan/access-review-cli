@@ -1,9 +1,37 @@
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Type, TypeVar
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .dtutils import utcnow, ensure_utc, parse_iso_datetime
+
+
+E = TypeVar("E", bound=Enum)
+
+
+def _coerce_enum(value: Union[str, E, None], enum_cls: Type[E]) -> Optional[E]:
+    if value is None:
+        return None
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_cls(value.lower())
+        except ValueError:
+            valid = ", ".join(e.value for e in enum_cls)
+            raise ValueError(
+                f"非法值 '{value}'，允许的值为: {valid}"
+            ) from None
+    raise ValueError(f"不支持的类型: {type(value)}")
+
+
+def _coerce_enum_list(values: Union[List[str], List[E], None], enum_cls: Type[E]) -> List[E]:
+    if values is None:
+        return []
+    result = []
+    for v in values:
+        result.append(_coerce_enum(v, enum_cls))
+    return result
 
 
 class PermissionStatus(str, Enum):
@@ -25,6 +53,13 @@ class AnomalyType(str, Enum):
     UNUSED_LONG_TERM = "unused_long_term"
     EXPIRED_ACCESS = "expired_access"
     SUSPICIOUS_PATTERN = "suspicious_pattern"
+
+
+class SeverityLevel(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    CRITICAL = "critical"
 
 
 def _coerce_utc(v: Optional[Union[datetime, str]]) -> Optional[datetime]:
@@ -63,6 +98,13 @@ class UserPermission(BaseModel):
     def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
         return _coerce_utc(v)
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, v: Union[str, PermissionStatus, None]) -> PermissionStatus:
+        if v is None:
+            return PermissionStatus.ACTIVE
+        return _coerce_enum(v, PermissionStatus)
+
 
 class ReviewRecord(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -84,6 +126,19 @@ class ReviewRecord(BaseModel):
     def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
         return _coerce_utc(v)
 
+    @field_validator("result", mode="before")
+    @classmethod
+    def _coerce_result(cls, v: Union[str, ReviewResult]) -> ReviewResult:
+        result = _coerce_enum(v, ReviewResult)
+        if result is None:
+            raise ValueError("result 不能为空")
+        return result
+
+    @field_validator("anomaly_types", mode="before")
+    @classmethod
+    def _coerce_anomaly_types(cls, v: Optional[Union[List[str], List[AnomalyType]]]) -> List[AnomalyType]:
+        return _coerce_enum_list(v, AnomalyType)
+
 
 class AnomalyReport(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -91,7 +146,7 @@ class AnomalyReport(BaseModel):
     id: str
     permission_id: str
     anomaly_type: AnomalyType
-    severity: str
+    severity: SeverityLevel
     description: str
     detected_date: datetime
     resolved: bool = False
@@ -102,6 +157,22 @@ class AnomalyReport(BaseModel):
     @classmethod
     def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
         return _coerce_utc(v)
+
+    @field_validator("anomaly_type", mode="before")
+    @classmethod
+    def _coerce_anomaly_type(cls, v: Union[str, AnomalyType]) -> AnomalyType:
+        result = _coerce_enum(v, AnomalyType)
+        if result is None:
+            raise ValueError("anomaly_type 不能为空")
+        return result
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _coerce_severity(cls, v: Union[str, SeverityLevel]) -> SeverityLevel:
+        result = _coerce_enum(v, SeverityLevel)
+        if result is None:
+            raise ValueError("severity 不能为空")
+        return result
 
 
 class ReviewCycle(BaseModel):

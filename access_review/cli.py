@@ -22,8 +22,13 @@ from .models import (
     ReviewCycle,
     PermissionStatus,
     AnomalyType,
+    SeverityLevel,
 )
-from .anomaly_detector import AnomalyDetector
+from .anomaly_detector import (
+    AnomalyDetector,
+    MIN_UNUSED_DAYS,
+    MAX_UNUSED_DAYS,
+)
 from .report_generator import ReportGenerator
 
 app = typer.Typer(
@@ -39,6 +44,58 @@ def get_storage() -> Storage:
     if base_dir:
         return Storage(Path(base_dir))
     return Storage()
+
+
+def check_enum_value(param_name: str, value: Optional[str], enum_cls) -> Optional:
+    if value is None:
+        return None
+    normalized = value.lower()
+    try:
+        return enum_cls(normalized)
+    except ValueError:
+        valid = ", ".join(e.value for e in enum_cls)
+        console.print(
+            f"[red]✗[/red] 参数 --{param_name} 的值 '{value}' 非法，"
+            f"允许的值为: {valid}"
+        )
+        raise typer.Exit(1)
+
+
+def check_positive_int(
+    param_name: str,
+    value: int,
+    min_val: Optional[int] = None,
+    max_val: Optional[int] = None,
+) -> int:
+    if min_val is not None and value < min_val:
+        if max_val is not None:
+            range_str = f"范围 [{min_val}, {max_val}]"
+        else:
+            range_str = f"最小为 {min_val}"
+        console.print(
+            f"[red]✗[/red] 参数 --{param_name} 的值 {value} 超出允许{range_str}"
+        )
+        raise typer.Exit(1)
+    if max_val is not None and value > max_val:
+        range_str = f"范围 [{min_val or 0}, {max_val}]"
+        console.print(
+            f"[red]✗[/red] 参数 --{param_name} 的值 {value} 超出允许{range_str}"
+        )
+        raise typer.Exit(1)
+    return value
+
+
+def check_data_type(value: Optional[str]) -> Optional[str]:
+    allowed = {"permissions", "reviews", "anomalies", "cycles"}
+    if value is None:
+        return None
+    if value not in allowed:
+        console.print(
+            f"[red]✗[/red] 参数 --type 的值 '{value}' 非法，"
+            f"允许的值为: {', '.join(sorted(allowed))}"
+        )
+        raise typer.Exit(1)
+    return value
 
 
 @app.command()
@@ -127,6 +184,14 @@ def export_permissions(
     storage = get_storage()
     report_gen = ReportGenerator(storage)
 
+    data_type = check_data_type(data_type)
+
+    if format not in {"json", "csv"}:
+        console.print(
+            f"[red]✗[/red] 参数 --format 的值 '{format}' 非法，允许的值为: json, csv"
+        )
+        raise typer.Exit(1)
+
     if format == "csv":
         if data_type == "permissions" or data_type is None:
             count = report_gen.export_permission_list_csv(output_path)
@@ -151,8 +216,12 @@ def list_permissions(
     storage = get_storage()
     permissions = storage.list_permissions()
 
-    if status:
-        permissions = [p for p in permissions if p.status == status]
+    status_enum = check_enum_value("status", status, PermissionStatus)
+    if status_enum:
+        permissions = [p for p in permissions if p.status == status_enum]
+
+    limit = check_positive_int("limit", limit, min_val=1, max_val=10000)
+
     if department:
         permissions = [p for p in permissions if department.lower() in p.department.lower()]
     if username:
@@ -459,19 +528,20 @@ def record_review(
         console.print(f"[red]✗[/red] 未找到权限记录: {permission_id}")
         raise typer.Exit(1)
 
-    try:
-        review_result = ReviewResult(result)
-    except ValueError:
-        console.print(f"[red]✗[/red] 无效的复核结果: {result}")
+    review_result = check_enum_value("result", result, ReviewResult)
+    if review_result is None:
+        console.print("[red]✗[/red] 参数 --result 不能为空")
         raise typer.Exit(1)
 
     anomaly_list = []
     if anomaly_types:
-        for at in anomaly_types.split(","):
-            try:
-                anomaly_list.append(AnomalyType(at.strip()))
-            except ValueError:
-                console.print(f"[yellow]![/yellow] 跳过无效的异常类型: {at.strip()}")
+        for at_str in anomaly_types.split(","):
+            at_val = at_str.strip()
+            if not at_val:
+                continue
+            at_enum = check_enum_value("anomaly", at_val, AnomalyType)
+            if at_enum:
+                anomaly_list.append(at_enum)
 
     review = ReviewRecord(
         id=Storage.generate_id(),
@@ -502,7 +572,7 @@ def pending_reviews(
     """列出待复核的权限"""
     storage = get_storage()
     permissions = storage.list_permissions()
-    pending_perms = [p for p in permissions if p.status == "pending_review"]
+    pending_perms = [p for p in permissions if p.status == PermissionStatus.PENDING_REVIEW]
 
     if department:
         pending_perms = [p for p in pending_perms if department.lower() in p.department.lower()]
@@ -511,6 +581,7 @@ def pending_reviews(
         console.print("[green]✓[/green] 没有待复核的权限")
         return
 
+    limit = check_positive_int("limit", limit, min_val=1, max_val=10000)
     pending_perms = pending_perms[:limit]
 
     table = Table(title=f"待复核权限 (共 {len(pending_perms)} 条)")
@@ -543,6 +614,12 @@ def detect_anomalies(
     unused_days: int = typer.Option(90, "--unused-days", help="未使用天数阈值"),
 ):
     """检测异常权限"""
+    check_positive_int(
+        "unused-days",
+        unused_days,
+        min_val=MIN_UNUSED_DAYS,
+        max_val=MAX_UNUSED_DAYS,
+    )
     storage = get_storage()
     detector = AnomalyDetector(storage, unused_days=unused_days)
 
@@ -579,10 +656,13 @@ def list_anomalies(
     storage = get_storage()
     anomalies = storage.list_anomalies(unresolved_only=unresolved_only)
 
-    if anomaly_type:
-        anomalies = [a for a in anomalies if a.anomaly_type == anomaly_type]
-    if severity:
-        anomalies = [a for a in anomalies if a.severity == severity]
+    anomaly_type_enum = check_enum_value("type", anomaly_type, AnomalyType)
+    if anomaly_type_enum:
+        anomalies = [a for a in anomalies if a.anomaly_type == anomaly_type_enum]
+
+    severity_enum = check_enum_value("severity", severity, SeverityLevel)
+    if severity_enum:
+        anomalies = [a for a in anomalies if a.severity == severity_enum]
 
     if not anomalies:
         console.print("[yellow]![/yellow] 没有找到异常记录")
@@ -861,6 +941,26 @@ def quarterly(
     output_dir: Path = typer.Option(Path("./reports"), "--output", "-o", help="报告输出目录"),
 ):
     """执行完整的季度复核流程 (一键运行)"""
+    check_positive_int(
+        "unused-days",
+        unused_days,
+        min_val=MIN_UNUSED_DAYS,
+        max_val=MAX_UNUSED_DAYS,
+    )
+
+    allowed_quarters = {"q1", "q2", "q3", "q4"}
+    quarter_normalized = quarter.lower()
+    if quarter_normalized not in allowed_quarters:
+        console.print(
+            f"[red]✗[/red] 参数 quarter 的值 '{quarter}' 非法，"
+            f"允许的值为: Q1, Q2, Q3, Q4 (大小写不敏感)"
+        )
+        raise typer.Exit(1)
+    quarter = quarter.upper()
+
+    allowed_years = (1970, 9999)
+    check_positive_int("year", year, min_val=allowed_years[0], max_val=allowed_years[1])
+
     storage = get_storage()
     detector = AnomalyDetector(storage, unused_days=unused_days)
     report_gen = ReportGenerator(storage)

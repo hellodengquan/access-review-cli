@@ -2,21 +2,37 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 
-from .models import UserPermission, AnomalyReport, AnomalyType
+from .models import (
+    UserPermission,
+    AnomalyReport,
+    AnomalyType,
+    SeverityLevel,
+    PermissionStatus,
+)
 from .storage import Storage
 from .dtutils import utcnow
+
+MAX_UNUSED_DAYS = 365 * 3
+MIN_UNUSED_DAYS = 1
 
 
 class AnomalyDetector:
     def __init__(self, storage: Storage, unused_days: int = 90, high_risk_roles=None, high_risk_resources=None):
         self.storage = storage
+        if not isinstance(unused_days, int):
+            raise ValueError(f"unused_days 必须是整数，当前类型: {type(unused_days)}")
+        if unused_days < MIN_UNUSED_DAYS or unused_days > MAX_UNUSED_DAYS:
+            raise ValueError(
+                f"unused_days 必须在 {MIN_UNUSED_DAYS} 到 {MAX_UNUSED_DAYS} 天之间，"
+                f"当前值: {unused_days}"
+            )
         self.unused_days = unused_days
         self.high_risk_roles = high_risk_roles or ["admin", "superuser", "root", "owner"]
         self.high_risk_resources = high_risk_resources or ["production", "prod", "database", "db", "pii"]
 
     def detect_all(self) -> List[AnomalyReport]:
         permissions = self.storage.list_permissions()
-        active_permissions = [p for p in permissions if p.status == "active"]
+        active_permissions = [p for p in permissions if p.status == PermissionStatus.ACTIVE]
 
         anomalies = []
         anomalies.extend(self.detect_unused_permissions(active_permissions))
@@ -49,7 +65,7 @@ class AnomalyDetector:
                     id=Storage.generate_id(),
                     permission_id=perm.id,
                     anomaly_type=AnomalyType.UNUSED_LONG_TERM,
-                    severity="medium",
+                    severity=SeverityLevel.MEDIUM,
                     description=f"权限已超过 {days_unused} 天未使用",
                     detected_date=now,
                 )
@@ -68,7 +84,7 @@ class AnomalyDetector:
                     id=Storage.generate_id(),
                     permission_id=perm.id,
                     anomaly_type=AnomalyType.EXPIRED_ACCESS,
-                    severity="high",
+                    severity=SeverityLevel.HIGH,
                     description=f"权限已过期 {days_expired} 天，应立即收回",
                     detected_date=now,
                 )
@@ -112,7 +128,7 @@ class AnomalyDetector:
                 risk_reasons.append(f"权限数量过多: {count} 个")
 
             if is_high_risk:
-                severity = "high" if len(risk_reasons) >= 2 else "medium"
+                severity = SeverityLevel.HIGH if len(risk_reasons) >= 2 else SeverityLevel.MEDIUM
                 anomaly = AnomalyReport(
                     id=Storage.generate_id(),
                     permission_id=perm.id,
@@ -133,7 +149,7 @@ class AnomalyDetector:
         recent_high_risk = [
             p for p in permissions
             if p.granted_date > thirty_days_ago
-            and p.status == "active"
+            and p.status == PermissionStatus.ACTIVE
         ]
 
         dept_perms: Dict[str, List[UserPermission]] = defaultdict(list)
@@ -147,7 +163,7 @@ class AnomalyDetector:
                         id=Storage.generate_id(),
                         permission_id=perm.id,
                         anomaly_type=AnomalyType.SUSPICIOUS_PATTERN,
-                        severity="medium",
+                        severity=SeverityLevel.MEDIUM,
                         description=f"部门 {dept} 近期 ({len(perms)} 个) 权限授予异常集中",
                         detected_date=now,
                     )
@@ -158,7 +174,7 @@ class AnomalyDetector:
     def get_summary(self, unresolved_only: bool = True) -> Dict[str, Any]:
         anomalies = self.storage.list_anomalies(unresolved_only=unresolved_only)
         permissions = self.storage.list_permissions()
-        active_perms = [p for p in permissions if p.status == "active"]
+        active_perms = [p for p in permissions if p.status == PermissionStatus.ACTIVE]
 
         by_type: Dict[str, int] = defaultdict(int)
         by_severity: Dict[str, int] = defaultdict(int)
@@ -166,13 +182,13 @@ class AnomalyDetector:
 
         for anomaly in anomalies:
             by_type[anomaly.anomaly_type.value] += 1
-            by_severity[anomaly.severity] += 1
+            by_severity[anomaly.severity.value] += 1
             affected_permission_ids.add(anomaly.permission_id)
 
         high_risk_perms = [
             p for p in active_perms
             if p.id in affected_permission_ids
-            and any(a.severity == "high" for a in anomalies if a.permission_id == p.id)
+            and any(a.severity == SeverityLevel.HIGH for a in anomalies if a.permission_id == p.id)
         ]
 
         return {
@@ -193,14 +209,14 @@ class AnomalyDetector:
         candidates = []
         for anomaly in anomalies:
             perm = perm_map.get(anomaly.permission_id)
-            if not perm or perm.status != "active":
+            if not perm or perm.status != PermissionStatus.ACTIVE:
                 continue
 
             if anomaly.anomaly_type in [AnomalyType.EXPIRED_ACCESS, AnomalyType.UNUSED_LONG_TERM]:
                 candidates.append({
                     "permission": perm,
                     "anomaly": anomaly,
-                    "priority": "critical" if anomaly.severity == "high" else "normal",
+                    "priority": "critical" if anomaly.severity == SeverityLevel.HIGH else "normal",
                 })
 
         candidates.sort(key=lambda x: (x["priority"] != "critical", x["anomaly"].detected_date))
