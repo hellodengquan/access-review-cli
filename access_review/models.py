@@ -1,7 +1,9 @@
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Union
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+from .dtutils import utcnow, ensure_utc, parse_iso_datetime
 
 
 class PermissionStatus(str, Enum):
@@ -25,6 +27,14 @@ class AnomalyType(str, Enum):
     SUSPICIOUS_PATTERN = "suspicious_pattern"
 
 
+def _coerce_utc(v: Optional[Union[datetime, str]]) -> Optional[datetime]:
+    if v is None:
+        return v
+    if isinstance(v, str):
+        return parse_iso_datetime(v)
+    return ensure_utc(v)
+
+
 class UserPermission(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -42,8 +52,16 @@ class UserPermission(BaseModel):
     granted_by: Optional[str] = None
     description: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator(
+        "granted_date", "last_used_date", "expiry_date",
+        "created_at", "updated_at", mode="before",
+    )
+    @classmethod
+    def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
+        return _coerce_utc(v)
 
 
 class ReviewRecord(BaseModel):
@@ -57,7 +75,14 @@ class ReviewRecord(BaseModel):
     comments: Optional[str] = None
     anomaly_types: List[AnomalyType] = Field(default_factory=list)
     follow_up_date: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator(
+        "review_date", "follow_up_date", "created_at", mode="before",
+    )
+    @classmethod
+    def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
+        return _coerce_utc(v)
 
 
 class AnomalyReport(BaseModel):
@@ -73,6 +98,11 @@ class AnomalyReport(BaseModel):
     resolved_date: Optional[datetime] = None
     resolution_notes: Optional[str] = None
 
+    @field_validator("detected_date", "resolved_date", mode="before")
+    @classmethod
+    def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
+        return _coerce_utc(v)
+
 
 class ReviewCycle(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -85,4 +115,9 @@ class ReviewCycle(BaseModel):
     end_date: Optional[datetime] = None
     status: str = "in_progress"
     description: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("start_date", "end_date", "created_at", mode="before")
+    @classmethod
+    def _coerce_utc_field(cls, v: Optional[Union[datetime, str]]) -> Optional[datetime]:
+        return _coerce_utc(v)

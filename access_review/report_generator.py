@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from .models import UserPermission, ReviewRecord, AnomalyReport, ReviewCycle, AnomalyType
 from .storage import Storage
+from .dtutils import utcnow
 
 
 class ReportGenerator:
@@ -21,7 +22,7 @@ class ReportGenerator:
         if cycle:
             reviews = [
                 r for r in reviews
-                if cycle.start_date <= r.review_date <= (cycle.end_date or datetime.now())
+                if cycle.start_date <= r.review_date <= (cycle.end_date or utcnow())
             ]
 
         total_perms = len(permissions)
@@ -59,7 +60,7 @@ class ReportGenerator:
                 by_department[perm.department]["anomalies"] += 1
 
         return {
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": utcnow().isoformat(),
             "cycle": cycle.model_dump(mode="json") if cycle else None,
             "summary": {
                 "total_permissions": total_perms,
@@ -181,7 +182,7 @@ class ReportGenerator:
             })
 
         report = {
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": utcnow().isoformat(),
             "total_unresolved": len(anomalies),
             "by_type": {k: v for k, v in by_type.items()},
         }
@@ -203,7 +204,7 @@ class ReportGenerator:
             anomalies.extend(self.storage.get_anomalies_for_permission(perm.id))
 
         return {
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": utcnow().isoformat(),
             "username": username,
             "permissions": [p.model_dump(mode="json") for p in user_perms],
             "reviews": [r.model_dump(mode="json") for r in reviews],

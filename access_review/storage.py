@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Type, TypeVar, Dict, Any
 from rich.console import Console
+from pydantic import ValidationError
 
 from .models import (
     UserPermission,
@@ -12,6 +13,7 @@ from .models import (
     AnomalyReport,
     ReviewCycle,
 )
+from .dtutils import utcnow
 
 T = TypeVar("T", UserPermission, ReviewRecord, AnomalyReport, ReviewCycle)
 
@@ -72,7 +74,7 @@ class Storage:
         return items
 
     def save_permission(self, permission: UserPermission) -> None:
-        permission.updated_at = datetime.now()
+        permission.updated_at = utcnow()
         self.save(permission, "permissions")
 
     def load_permission(self, id: str) -> Optional[UserPermission]:
@@ -156,33 +158,91 @@ class Storage:
             data = json.load(f)
 
         counts = {"permissions": 0, "reviews": 0, "anomalies": 0, "cycles": 0}
+        errors = []
 
-        for perm_data in data.get("permissions", []):
-            perm = UserPermission(**perm_data)
+        required_perm_fields = [
+            "id", "username", "email", "department", "role",
+            "resource", "permission_level", "granted_date",
+        ]
+
+        for idx, perm_data in enumerate(data.get("permissions", [])):
+            missing = [f for f in required_perm_fields if f not in perm_data]
+            if missing:
+                errors.append(
+                    f"permissions[{idx}]: 缺少必填字段: {', '.join(missing)}"
+                )
+                continue
+            try:
+                perm = UserPermission(**perm_data)
+            except ValidationError as exc:
+                errors.append(f"permissions[{idx}] (id={perm_data.get('id', '?')}): {exc}")
+                continue
             if overwrite or not self.load_permission(perm.id):
                 self.save_permission(perm)
                 counts["permissions"] += 1
 
-        for review_data in data.get("reviews", []):
-            review = ReviewRecord(**review_data)
+        required_review_fields = [
+            "id", "permission_id", "reviewer", "review_date", "result",
+        ]
+        for idx, review_data in enumerate(data.get("reviews", [])):
+            missing = [f for f in required_review_fields if f not in review_data]
+            if missing:
+                errors.append(
+                    f"reviews[{idx}]: 缺少必填字段: {', '.join(missing)}"
+                )
+                continue
+            try:
+                review = ReviewRecord(**review_data)
+            except ValidationError as exc:
+                errors.append(f"reviews[{idx}] (id={review_data.get('id', '?')}): {exc}")
+                continue
             existing = self.load_review(review.id)
             if overwrite or not existing:
                 self.save_review(review)
                 counts["reviews"] += 1
 
-        for anomaly_data in data.get("anomalies", []):
-            anomaly = AnomalyReport(**anomaly_data)
+        required_anomaly_fields = [
+            "id", "permission_id", "anomaly_type", "severity",
+            "description", "detected_date",
+        ]
+        for idx, anomaly_data in enumerate(data.get("anomalies", [])):
+            missing = [f for f in required_anomaly_fields if f not in anomaly_data]
+            if missing:
+                errors.append(
+                    f"anomalies[{idx}]: 缺少必填字段: {', '.join(missing)}"
+                )
+                continue
+            try:
+                anomaly = AnomalyReport(**anomaly_data)
+            except ValidationError as exc:
+                errors.append(f"anomalies[{idx}] (id={anomaly_data.get('id', '?')}): {exc}")
+                continue
             existing = self.load_anomaly(anomaly.id)
             if overwrite or not existing:
                 self.save_anomaly(anomaly)
                 counts["anomalies"] += 1
 
-        for cycle_data in data.get("cycles", []):
-            cycle = ReviewCycle(**cycle_data)
+        required_cycle_fields = ["id", "name", "quarter", "year", "start_date"]
+        for idx, cycle_data in enumerate(data.get("cycles", [])):
+            missing = [f for f in required_cycle_fields if f not in cycle_data]
+            if missing:
+                errors.append(
+                    f"cycles[{idx}]: 缺少必填字段: {', '.join(missing)}"
+                )
+                continue
+            try:
+                cycle = ReviewCycle(**cycle_data)
+            except ValidationError as exc:
+                errors.append(f"cycles[{idx}] (id={cycle_data.get('id', '?')}): {exc}")
+                continue
             existing = self.load_cycle(cycle.id)
             if overwrite or not existing:
                 self.save_cycle(cycle)
                 counts["cycles"] += 1
+
+        if errors:
+            error_msg = "数据导入校验失败:\n" + "\n".join(errors)
+            raise ValueError(error_msg)
 
         return counts
 

@@ -13,6 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import print as rprint
 
 from . import __version__
+from .dtutils import utcnow, ensure_utc, parse_iso_datetime
 from .storage import Storage
 from .models import (
     UserPermission,
@@ -221,7 +222,7 @@ def add_permission(
         if not date_str:
             return None
         try:
-            return date_parser.parse(date_str)
+            return ensure_utc(date_parser.parse(date_str))
         except Exception:
             console.print(f"[red]✗[/red] 日期格式错误: {date_str}")
             raise typer.Exit(1)
@@ -234,7 +235,7 @@ def add_permission(
         role=role,
         resource=resource,
         permission_level=permission_level,
-        granted_date=parse_date(granted_date) or datetime.now(),
+        granted_date=parse_date(granted_date) or utcnow(),
         last_used_date=parse_date(last_used_date),
         expiry_date=parse_date(expiry_date),
         granted_by=granted_by,
@@ -371,7 +372,7 @@ def start_cycle(
         name=name,
         quarter=quarter,
         year=year,
-        start_date=datetime.now(),
+        start_date=utcnow(),
         description=description,
     )
     storage.save_cycle(cycle)
@@ -403,7 +404,7 @@ def close_cycle(
         raise typer.Exit(1)
 
     cycle.status = "completed"
-    cycle.end_date = datetime.now()
+    cycle.end_date = utcnow()
     storage.save_cycle(cycle)
     console.print(f"[green]✓[/green] 复核周期 {cycle.name} 已关闭")
 
@@ -476,7 +477,7 @@ def record_review(
         id=Storage.generate_id(),
         permission_id=permission_id,
         reviewer=reviewer,
-        review_date=datetime.now(),
+        review_date=utcnow(),
         result=review_result,
         comments=comments,
         anomaly_types=anomaly_list,
@@ -881,7 +882,7 @@ def quarterly(
         name=name,
         quarter=quarter,
         year=year,
-        start_date=datetime.now(),
+        start_date=utcnow(),
         description=f"{year}年{quarter}季度权限复核",
     )
     storage.save_cycle(cycle)

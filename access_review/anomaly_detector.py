@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from .models import UserPermission, AnomalyReport, AnomalyType
 from .storage import Storage
+from .dtutils import utcnow
 
 
 class AnomalyDetector:
@@ -30,7 +31,8 @@ class AnomalyDetector:
 
     def detect_unused_permissions(self, permissions: List[UserPermission]) -> List[AnomalyReport]:
         anomalies = []
-        threshold_date = datetime.now() - timedelta(days=self.unused_days)
+        now = utcnow()
+        threshold_date = now - timedelta(days=self.unused_days)
 
         for perm in permissions:
             is_unused = False
@@ -42,14 +44,14 @@ class AnomalyDetector:
                     is_unused = True
 
             if is_unused:
-                days_unused = (datetime.now() - (perm.last_used_date or perm.granted_date)).days
+                days_unused = (now - (perm.last_used_date or perm.granted_date)).days
                 anomaly = AnomalyReport(
                     id=Storage.generate_id(),
                     permission_id=perm.id,
                     anomaly_type=AnomalyType.UNUSED_LONG_TERM,
                     severity="medium",
                     description=f"权限已超过 {days_unused} 天未使用",
-                    detected_date=datetime.now(),
+                    detected_date=now,
                 )
                 anomalies.append(anomaly)
 
@@ -57,7 +59,7 @@ class AnomalyDetector:
 
     def detect_expired_permissions(self, permissions: List[UserPermission]) -> List[AnomalyReport]:
         anomalies = []
-        now = datetime.now()
+        now = utcnow()
 
         for perm in permissions:
             if perm.expiry_date and perm.expiry_date < now:
@@ -68,7 +70,7 @@ class AnomalyDetector:
                     anomaly_type=AnomalyType.EXPIRED_ACCESS,
                     severity="high",
                     description=f"权限已过期 {days_expired} 天，应立即收回",
-                    detected_date=datetime.now(),
+                    detected_date=now,
                 )
                 anomalies.append(anomaly)
 
@@ -76,6 +78,7 @@ class AnomalyDetector:
 
     def detect_over_privileged(self, permissions: List[UserPermission]) -> List[AnomalyReport]:
         anomalies = []
+        now = utcnow()
         perm_counts: Dict[Tuple[str, str], int] = defaultdict(int)
 
         for perm in permissions:
@@ -116,7 +119,7 @@ class AnomalyDetector:
                     anomaly_type=AnomalyType.OVER_PRIVILEGED,
                     severity=severity,
                     description="潜在越权风险: " + "; ".join(risk_reasons),
-                    detected_date=datetime.now(),
+                    detected_date=now,
                 )
                 anomalies.append(anomaly)
 
@@ -124,7 +127,7 @@ class AnomalyDetector:
 
     def detect_suspicious_patterns(self, permissions: List[UserPermission]) -> List[AnomalyReport]:
         anomalies = []
-        now = datetime.now()
+        now = utcnow()
         thirty_days_ago = now - timedelta(days=30)
 
         recent_high_risk = [
@@ -146,7 +149,7 @@ class AnomalyDetector:
                         anomaly_type=AnomalyType.SUSPICIOUS_PATTERN,
                         severity="medium",
                         description=f"部门 {dept} 近期 ({len(perms)} 个) 权限授予异常集中",
-                        detected_date=datetime.now(),
+                        detected_date=now,
                     )
                     anomalies.append(anomaly)
 
@@ -209,7 +212,7 @@ class AnomalyDetector:
             return False
 
         anomaly.resolved = True
-        anomaly.resolved_date = datetime.now()
+        anomaly.resolved_date = utcnow()
         anomaly.resolution_notes = notes
         self.storage.save_anomaly(anomaly)
         return True
