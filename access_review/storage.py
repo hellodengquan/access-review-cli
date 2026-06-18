@@ -150,14 +150,63 @@ class Storage:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(export_data, f, indent=2, ensure_ascii=False)
 
-    def import_from_json(self, input_path: Path, overwrite: bool = False) -> Dict[str, int]:
+    @staticmethod
+    def _permission_business_key(perm: UserPermission) -> tuple:
+        return (
+            perm.username.lower(),
+            perm.resource.lower(),
+            perm.role.lower(),
+        )
+
+    @staticmethod
+    def _merge_permissions(target: UserPermission, source: UserPermission) -> UserPermission:
+        if target.granted_date and source.granted_date:
+            if source.granted_date > target.granted_date:
+                target.id = source.id
+                target.granted_date = source.granted_date
+                target.permission_level = source.permission_level
+                target.status = source.status
+                target.granted_by = source.granted_by or target.granted_by
+        if source.last_used_date:
+            if not target.last_used_date or source.last_used_date > target.last_used_date:
+                target.last_used_date = source.last_used_date
+        if source.expiry_date and not target.expiry_date:
+            target.expiry_date = source.expiry_date
+        elif source.expiry_date and target.expiry_date:
+            if source.expiry_date > target.expiry_date:
+                target.expiry_date = source.expiry_date
+        if not target.email and source.email:
+            target.email = source.email
+        if not target.department and source.department:
+            target.department = source.department
+        if not target.description and source.description:
+            target.description = source.description
+        elif source.description and source.description not in target.description:
+            target.description = target.description + "; " + source.description
+        if source.tags:
+            merged_tags = list(dict.fromkeys(list(target.tags) + list(source.tags)))
+            target.tags = merged_tags
+        return target
+
+    def import_from_json(
+        self,
+        input_path: Path,
+        overwrite: bool = False,
+        dedupe: bool = True,
+    ) -> Dict[str, Any]:
         if not input_path.exists():
             raise FileNotFoundError(f"File not found: {input_path}")
 
         with open(input_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        counts = {"permissions": 0, "reviews": 0, "anomalies": 0, "cycles": 0}
+        counts = {
+            "permissions": 0,
+            "reviews": 0,
+            "anomalies": 0,
+            "cycles": 0,
+            "duplicates_merged": 0,
+        }
         errors = []
 
         required_perm_fields = [
@@ -165,6 +214,7 @@ class Storage:
             "resource", "permission_level", "granted_date",
         ]
 
+        raw_perms = []
         for idx, perm_data in enumerate(data.get("permissions", [])):
             missing = [f for f in required_perm_fields if f not in perm_data]
             if missing:
@@ -174,9 +224,45 @@ class Storage:
                 continue
             try:
                 perm = UserPermission(**perm_data)
+                raw_perms.append(perm)
             except ValidationError as exc:
                 errors.append(f"permissions[{idx}] (id={perm_data.get('id', '?')}): {exc}")
                 continue
+
+        if dedupe and raw_perms:
+            deduped: Dict[tuple, UserPermission] = {}
+            for perm in raw_perms:
+                key = self._permission_business_key(perm)
+                if key in deduped:
+                    deduped[key] = self._merge_permissions(deduped[key], perm)
+                    counts["duplicates_merged"] += 1
+                else:
+                    deduped[key] = perm
+            perms_to_import = list(deduped.values())
+        else:
+            perms_to_import = raw_perms
+
+        if dedupe:
+            existing_perms = self.list_permissions()
+            existing_by_key: Dict[tuple, UserPermission] = {}
+            for ep in existing_perms:
+                key = self._permission_business_key(ep)
+                existing_by_key[key] = ep
+
+            final_perms = []
+            for perm in perms_to_import:
+                key = self._permission_business_key(perm)
+                if key in existing_by_key:
+                    existing = existing_by_key[key]
+                    merged = self._merge_permissions(existing.model_copy(deep=True), perm)
+                    if overwrite or merged != existing:
+                        final_perms.append(merged)
+                        counts["duplicates_merged"] += 1
+                else:
+                    final_perms.append(perm)
+            perms_to_import = final_perms
+
+        for perm in perms_to_import:
             if overwrite or not self.load_permission(perm.id):
                 self.save_permission(perm)
                 counts["permissions"] += 1

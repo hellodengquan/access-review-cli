@@ -152,6 +152,7 @@ app.add_typer(permission_app, name="permission")
 def import_permissions(
     file_path: Path = typer.Argument(..., help="JSON 文件路径"),
     overwrite: bool = typer.Option(False, "--overwrite", "-o", help="是否覆盖已存在的记录"),
+    dedupe: bool = typer.Option(True, "--dedupe/--no-dedupe", help="是否按(username, resource, role)业务键去重合并"),
 ):
     """从 JSON 文件导入用户权限清单"""
     storage = get_storage()
@@ -162,16 +163,24 @@ def import_permissions(
     ) as progress:
         task = progress.add_task("正在导入权限数据...", total=None)
         try:
-            counts = storage.import_from_json(file_path, overwrite=overwrite)
+            counts = storage.import_from_json(file_path, overwrite=overwrite, dedupe=dedupe)
             progress.update(task, completed=True)
         except Exception as e:
             console.print(f"[red]✗[/red] 导入失败: {e}")
             raise typer.Exit(1)
 
     console.print("[green]✓[/green] 导入完成:")
+    label_map = {
+        "permissions": "权限记录",
+        "reviews": "复核记录",
+        "anomalies": "异常报告",
+        "cycles": "复核周期",
+        "duplicates_merged": "重复合并",
+    }
     for key, value in counts.items():
-        if value > 0:
-            console.print(f"  - {key}: {value} 条")
+        if isinstance(value, int) and value > 0:
+            label = label_map.get(key, key)
+            console.print(f"  - {label}: {value} 条")
 
 
 @permission_app.command("export")
@@ -924,6 +933,145 @@ def user_report(
                 f"[{status_style}]{p['status']}[/{status_style}]",
             )
         console.print(perm_table)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        console.print(f"[green]✓[/green] 报告已保存到: {output_path}")
+
+
+@report_app.command("aggregate")
+def aggregate_report(
+    group_by: str = typer.Option("department", "--group-by", "-g", help="聚合维度: user/role/department"),
+    output_path: Optional[Path] = typer.Option(None, "--output", "-o", help="输出 JSON 文件路径"),
+    limit: int = typer.Option(20, "--limit", "-n", help="显示分组数量 (按权限数降序)"),
+    show_details: bool = typer.Option(False, "--details", "-d", help="是否显示每个分组下的权限明细"),
+):
+    """生成聚合视图报告 (按用户/角色/部门)"""
+    storage = get_storage()
+    report_gen = ReportGenerator(storage)
+
+    group_by_normalized = group_by.lower()
+    allowed_group_by = {"user", "role", "department"}
+    if group_by_normalized not in allowed_group_by:
+        console.print(
+            f"[red]✗[/red] 参数 --group-by 的值 '{group_by}' 非法，"
+            f"允许的值为: {', '.join(sorted(allowed_group_by))}"
+        )
+        raise typer.Exit(1)
+
+    try:
+        report = report_gen.generate_aggregate_report(group_by_normalized)
+    except ValueError as e:
+        console.print(f"[red]✗[/red] 参数错误: {e}")
+        raise typer.Exit(1)
+
+    limit = check_positive_int("limit", limit, min_val=1, max_val=1000)
+
+    group_label_map = {
+        "user": "用户",
+        "role": "角色",
+        "department": "部门",
+    }
+    group_label = group_label_map.get(group_by_normalized, group_by_normalized)
+
+    rprint(Panel.fit(
+        f"[bold]聚合维度:[/bold] {group_label}\n"
+        f"[bold]分组总数:[/bold] {report['total_groups']}\n"
+        f"[bold]总权限数:[/bold] {report['total_permissions']}\n"
+        f"[bold]异常权限数:[/bold] [red]{report['total_anomalies']}[/red]",
+        title=f"聚合视图报告 (按{group_label})",
+        border_style="cyan"
+    ))
+
+    groups = report["groups"][:limit]
+    if not groups:
+        console.print("[yellow]![/yellow] 没有数据")
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            console.print(f"[green]✓[/green] 报告已保存到: {output_path}")
+        return
+
+    table = Table(title=f"分组概览 (显示前 {len(groups)} 组，按权限数降序)")
+    table.add_column(group_label, style="cyan", no_wrap=True)
+    table.add_column("权限数", style="bold", justify="right")
+    table.add_column("活跃", style="green", justify="right")
+    table.add_column("过期", style="yellow", justify="right")
+    table.add_column("待复核", style="blue", justify="right")
+    table.add_column("异常", style="red", justify="right")
+    table.add_column("高危", style="bold red", justify="right")
+
+    if group_by_normalized == "user":
+        table.add_column("涉及部门", style="dim")
+    elif group_by_normalized == "role":
+        table.add_column("涉及用户", style="dim")
+    else:
+        table.add_column("涉及角色", style="dim")
+
+    for g in groups:
+        extra_col = ""
+        if group_by_normalized == "user":
+            extra_col = str(g["department_count"])
+        elif group_by_normalized == "role":
+            extra_col = str(g["user_count"])
+        else:
+            extra_col = str(g["role_count"])
+
+        table.add_row(
+            g["group_key"],
+            str(g["permission_count"]),
+            str(g["active_count"]),
+            str(g["expired_count"]),
+            str(g["pending_count"]),
+            str(g["anomaly_count"]),
+            f"[bold red]{g['high_risk_count']}[/bold red]" if g["high_risk_count"] > 0 else "0",
+            extra_col,
+        )
+
+    console.print(table)
+
+    if show_details:
+        for g in groups:
+            if not g["permissions"]:
+                continue
+            detail_table = Table(
+                title=f"[cyan]{g['group_key']}[/cyan] - 权限明细 (共 {g['permission_count']} 条)",
+                show_lines=False,
+            )
+            detail_table.add_column("ID", style="dim")
+            if group_by_normalized != "user":
+                detail_table.add_column("用户", style="cyan")
+            detail_table.add_column("资源", style="green")
+            detail_table.add_column("权限级别", style="blue")
+            detail_table.add_column("状态", style="bold")
+            detail_table.add_column("最后使用", style="dim")
+
+            for p in g["permissions"][:10]:
+                status_style = "green" if p["status"] == "active" else "yellow" if p["status"] == "expired" else "red"
+                last_used = p["last_used_date"].split("T")[0] if p["last_used_date"] else "从未"
+                row_vals = [p["id"][:8]]
+                if group_by_normalized != "user":
+                    row_vals.append(p["username"])
+                row_vals.extend([
+                    p["resource"],
+                    p["permission_level"],
+                    f"[{status_style}]{p['status']}[/{status_style}]",
+                    last_used,
+                ])
+                detail_table.add_row(*row_vals)
+
+            if len(g["permissions"]) > 10:
+                detail_table.add_row(
+                    "...",
+                    "..." if group_by_normalized != "user" else None,
+                    f"还有 {len(g['permissions']) - 10} 条...",
+                    "",
+                    "",
+                    "",
+                )
+            console.print(detail_table)
+            console.print()
 
     if output_path:
         with open(output_path, "w", encoding="utf-8") as f:

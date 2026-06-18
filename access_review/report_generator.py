@@ -213,3 +213,105 @@ class ReportGenerator:
             "active_count": len([p for p in user_perms if p.status == "active"]),
             "anomaly_count": len([a for a in anomalies if not a.resolved]),
         }
+
+    def generate_aggregate_report(self, group_by: str = "department") -> Dict[str, Any]:
+        valid_group_by = {"user", "role", "department"}
+        if group_by not in valid_group_by:
+            raise ValueError(
+                f"group_by 必须是 {valid_group_by} 之一，当前值: {group_by}"
+            )
+
+        permissions = self.storage.list_permissions()
+        anomalies = self.storage.list_anomalies(unresolved_only=True)
+
+        anomaly_perm_ids = set(a.permission_id for a in anomalies)
+
+        groups: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "group_key": "",
+            "permission_count": 0,
+            "active_count": 0,
+            "expired_count": 0,
+            "revoked_count": 0,
+            "pending_count": 0,
+            "anomaly_count": 0,
+            "high_risk_count": 0,
+            "resources": set(),
+            "roles": set(),
+            "users": set(),
+            "departments": set(),
+            "permissions": [],
+        })
+
+        for perm in permissions:
+            if group_by == "user":
+                key = perm.username
+            elif group_by == "role":
+                key = perm.role
+            else:
+                key = perm.department
+
+            g = groups[key]
+            g["group_key"] = key
+            g["permission_count"] += 1
+            g["users"].add(perm.username)
+            g["departments"].add(perm.department)
+            g["roles"].add(perm.role)
+            g["resources"].add(perm.resource)
+
+            status_val = perm.status.value if hasattr(perm.status, 'value') else str(perm.status)
+            if status_val == "active":
+                g["active_count"] += 1
+            elif status_val == "expired":
+                g["expired_count"] += 1
+            elif status_val == "revoked":
+                g["revoked_count"] += 1
+            elif status_val == "pending_review":
+                g["pending_count"] += 1
+
+            if perm.id in anomaly_perm_ids:
+                g["anomaly_count"] += 1
+                perm_anomalies = [a for a in anomalies if a.permission_id == perm.id]
+                for a in perm_anomalies:
+                    sev = a.severity.value if hasattr(a.severity, 'value') else str(a.severity)
+                    if sev in ("high", "critical"):
+                        g["high_risk_count"] += 1
+                        break
+
+            g["permissions"].append({
+                "id": perm.id,
+                "username": perm.username,
+                "department": perm.department,
+                "role": perm.role,
+                "resource": perm.resource,
+                "permission_level": perm.permission_level,
+                "status": status_val,
+                "granted_date": perm.granted_date.isoformat(),
+                "last_used_date": perm.last_used_date.isoformat() if perm.last_used_date else None,
+            })
+
+        group_list = []
+        for key, g in sorted(groups.items(), key=lambda x: -x[1]["permission_count"]):
+            group_list.append({
+                "group_key": g["group_key"],
+                "permission_count": g["permission_count"],
+                "active_count": g["active_count"],
+                "expired_count": g["expired_count"],
+                "revoked_count": g["revoked_count"],
+                "pending_count": g["pending_count"],
+                "anomaly_count": g["anomaly_count"],
+                "high_risk_count": g["high_risk_count"],
+                "user_count": len(g["users"]),
+                "department_count": len(g["departments"]),
+                "role_count": len(g["roles"]),
+                "resource_count": len(g["resources"]),
+                "permissions": g["permissions"],
+            })
+
+        return {
+            "generated_at": utcnow().isoformat(),
+            "group_by": group_by,
+            "total_groups": len(group_list),
+            "total_permissions": len(permissions),
+            "total_anomalies": len(anomalies),
+            "groups": group_list,
+        }
