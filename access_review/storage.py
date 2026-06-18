@@ -151,9 +151,27 @@ class Storage:
             json.dump(export_data, f, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def _permission_business_key(perm: UserPermission) -> tuple:
+    def _normalize_identity(perm: UserPermission) -> str:
+        if perm.email and perm.email.strip():
+            return perm.email.strip().lower()
+        username = perm.username.strip().lower()
+        for suffix in ("_ext", "_tmp", "-ext", "-tmp", ".ext", ".tmp"):
+            if username.endswith(suffix):
+                username = username[: -len(suffix)]
+        parts = username.split("_")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            username = "_".join(parts[:-1])
+        return username
+
+    @staticmethod
+    def _permission_business_key(perm: UserPermission, use_email: bool = True) -> tuple:
+        identity = (
+            Storage._normalize_identity(perm)
+            if use_email
+            else perm.username.lower()
+        )
         return (
-            perm.username.lower(),
+            identity,
             perm.resource.lower(),
             perm.role.lower(),
         )
@@ -179,6 +197,8 @@ class Storage:
             target.email = source.email
         if not target.department and source.department:
             target.department = source.department
+        elif target.department and source.department and target.department != source.department:
+            target.department = target.department + "; " + source.department
         if not target.description and source.description:
             target.description = source.description
         elif source.description and source.description not in target.description:
@@ -193,6 +213,7 @@ class Storage:
         input_path: Path,
         overwrite: bool = False,
         dedupe: bool = True,
+        cross_ou: bool = True,
     ) -> Dict[str, Any]:
         if not input_path.exists():
             raise FileNotFoundError(f"File not found: {input_path}")
@@ -206,6 +227,7 @@ class Storage:
             "anomalies": 0,
             "cycles": 0,
             "duplicates_merged": 0,
+            "cross_ou_merged": 0,
         }
         errors = []
 
@@ -232,10 +254,13 @@ class Storage:
         if dedupe and raw_perms:
             deduped: Dict[tuple, UserPermission] = {}
             for perm in raw_perms:
-                key = self._permission_business_key(perm)
+                key = self._permission_business_key(perm, use_email=cross_ou)
                 if key in deduped:
+                    prev_dept = deduped[key].department
                     deduped[key] = self._merge_permissions(deduped[key], perm)
                     counts["duplicates_merged"] += 1
+                    if cross_ou and prev_dept != deduped[key].department and ";" in deduped[key].department:
+                        counts["cross_ou_merged"] += 1
                 else:
                     deduped[key] = perm
             perms_to_import = list(deduped.values())
@@ -246,18 +271,21 @@ class Storage:
             existing_perms = self.list_permissions()
             existing_by_key: Dict[tuple, UserPermission] = {}
             for ep in existing_perms:
-                key = self._permission_business_key(ep)
+                key = self._permission_business_key(ep, use_email=cross_ou)
                 existing_by_key[key] = ep
 
             final_perms = []
             for perm in perms_to_import:
-                key = self._permission_business_key(perm)
+                key = self._permission_business_key(perm, use_email=cross_ou)
                 if key in existing_by_key:
                     existing = existing_by_key[key]
+                    prev_dept = existing.department
                     merged = self._merge_permissions(existing.model_copy(deep=True), perm)
                     if overwrite or merged != existing:
                         final_perms.append(merged)
                         counts["duplicates_merged"] += 1
+                        if cross_ou and prev_dept != merged.department and ";" in merged.department:
+                            counts["cross_ou_merged"] += 1
                 else:
                     final_perms.append(perm)
             perms_to_import = final_perms

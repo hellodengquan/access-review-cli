@@ -10,6 +10,14 @@ from .storage import Storage
 from .dtutils import utcnow
 
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+
 class ReportGenerator:
     def __init__(self, storage: Storage):
         self.storage = storage
@@ -315,3 +323,186 @@ class ReportGenerator:
             "total_anomalies": len(anomalies),
             "groups": group_list,
         }
+
+    def export_aggregate_csv(self, report: Dict[str, Any], output_path: Path) -> int:
+        group_by = report.get("group_by", "department")
+        groups = report.get("groups", [])
+
+        label_map = {
+            "user": "用户",
+            "role": "角色",
+            "department": "部门",
+        }
+        group_label = label_map.get(group_by, group_by)
+
+        summary_rows = []
+        for g in groups:
+            summary_rows.append({
+                group_label: g["group_key"],
+                "权限总数": g["permission_count"],
+                "活跃权限": g["active_count"],
+                "已过期": g["expired_count"],
+                "已收回": g["revoked_count"],
+                "待复核": g["pending_count"],
+                "异常数": g["anomaly_count"],
+                "高风险数": g["high_risk_count"],
+                "涉及用户数": g["user_count"],
+                "涉及部门数": g["department_count"],
+                "涉及角色数": g["role_count"],
+                "涉及资源数": g["resource_count"],
+            })
+
+        summary_headers = list(summary_rows[0].keys()) if summary_rows else [group_label, "权限总数"]
+        detail_rows = []
+        for g in groups:
+            for idx, p in enumerate(g.get("permissions", []), start=1):
+                row = {
+                    group_label: g["group_key"],
+                    "序号": idx,
+                    "权限ID": p["id"],
+                    "用户名": p["username"],
+                    "部门": p["department"],
+                    "角色": p["role"],
+                    "资源": p["resource"],
+                    "权限级别": p["permission_level"],
+                    "状态": p["status"],
+                    "授予日期": p["granted_date"].split("T")[0] if p["granted_date"] else "",
+                    "最后使用": p["last_used_date"].split("T")[0] if p["last_used_date"] else "",
+                }
+                detail_rows.append(row)
+
+        detail_headers = list(detail_rows[0].keys()) if detail_rows else []
+
+        if output_path.suffix.lower() != ".csv":
+            output_path = output_path.with_suffix(".csv")
+
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            if summary_rows:
+                writer = csv.DictWriter(f, fieldnames=summary_headers)
+                f.write(f"# 聚合视图 - 按{group_label}分组 (概览)\n")
+                writer.writeheader()
+                writer.writerows(summary_rows)
+                f.write("\n")
+
+            if detail_rows:
+                writer = csv.DictWriter(f, fieldnames=detail_headers)
+                f.write(f"# 聚合视图 - 按{group_label}分组 (明细)\n")
+                writer.writeheader()
+                writer.writerows(detail_rows)
+
+        return len(summary_rows) + len(detail_rows)
+
+    def export_aggregate_excel(self, report: Dict[str, Any], output_path: Path) -> int:
+        if not HAS_OPENPYXL:
+            raise ImportError(
+                "缺少 openpyxl 依赖，无法导出 Excel。"
+                "请执行: pip install openpyxl"
+            )
+
+        group_by = report.get("group_by", "department")
+        groups = report.get("groups", [])
+
+        label_map = {
+            "user": "用户",
+            "role": "角色",
+            "department": "部门",
+        }
+        group_label = label_map.get(group_by, group_by)
+
+        wb = Workbook()
+
+        ws_summary = wb.active
+        ws_summary.title = f"概览-{group_label}"
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        summary_headers = [
+            group_label, "权限总数", "活跃权限", "已过期", "已收回", "待复核",
+            "异常数", "高风险数", "涉及用户数", "涉及部门数", "涉及角色数", "涉及资源数",
+        ]
+
+        for col_idx, header in enumerate(summary_headers, start=1):
+            cell = ws_summary.cell(row=1, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+
+        for row_idx, g in enumerate(groups, start=2):
+            row_data = [
+                g["group_key"],
+                g["permission_count"],
+                g["active_count"],
+                g["expired_count"],
+                g["revoked_count"],
+                g["pending_count"],
+                g["anomaly_count"],
+                g["high_risk_count"],
+                g["user_count"],
+                g["department_count"],
+                g["role_count"],
+                g["resource_count"],
+            ]
+            for col_idx, val in enumerate(row_data, start=1):
+                ws_summary.cell(row=row_idx, column=col_idx, value=val)
+
+        for col_idx in range(1, len(summary_headers) + 1):
+            ws_summary.column_dimensions[chr(64 + col_idx)].width = 14
+        ws_summary.column_dimensions["A"].width = 20
+
+        ws_detail = wb.create_sheet(title=f"明细-{group_label}")
+        detail_headers = [
+            group_label, "序号", "权限ID", "用户名", "部门", "角色", "资源",
+            "权限级别", "状态", "授予日期", "最后使用",
+        ]
+        for col_idx, header in enumerate(detail_headers, start=1):
+            cell = ws_detail.cell(row=1, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+
+        row_idx = 2
+        for g in groups:
+            for idx, p in enumerate(g.get("permissions", []), start=1):
+                row_data = [
+                    g["group_key"],
+                    idx,
+                    p["id"],
+                    p["username"],
+                    p["department"],
+                    p["role"],
+                    p["resource"],
+                    p["permission_level"],
+                    p["status"],
+                    p["granted_date"].split("T")[0] if p["granted_date"] else "",
+                    p["last_used_date"].split("T")[0] if p["last_used_date"] else "",
+                ]
+                for col_idx, val in enumerate(row_data, start=1):
+                    ws_detail.cell(row=row_idx, column=col_idx, value=val)
+                row_idx += 1
+
+        ws_detail_widths = [20, 6, 16, 12, 12, 12, 22, 10, 10, 12, 12]
+        for col_idx, width in enumerate(ws_detail_widths, start=1):
+            ws_detail.column_dimensions[chr(64 + col_idx)].width = width
+
+        ws_meta = wb.create_sheet(title="元信息")
+        meta_rows = [
+            ("生成时间", report.get("generated_at", "")),
+            ("聚合维度", group_by),
+            ("分组总数", report.get("total_groups", 0)),
+            ("总权限数", report.get("total_permissions", 0)),
+            ("未解决异常数", report.get("total_anomalies", 0)),
+        ]
+        for row_idx, (key, val) in enumerate(meta_rows, start=1):
+            ws_meta.cell(row=row_idx, column=1, value=key).font = header_font
+            ws_meta.cell(row=row_idx, column=1).fill = header_fill
+            ws_meta.cell(row=row_idx, column=2, value=val)
+        ws_meta.column_dimensions["A"].width = 18
+        ws_meta.column_dimensions["B"].width = 40
+
+        if output_path.suffix.lower() not in (".xlsx", ".xlsm"):
+            output_path = output_path.with_suffix(".xlsx")
+        wb.save(output_path)
+
+        return len(groups) + sum(len(g.get("permissions", [])) for g in groups)

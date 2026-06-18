@@ -1,5 +1,8 @@
 import os
 import json
+import sys
+import shlex
+import atexit
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -30,13 +33,167 @@ from .anomaly_detector import (
     MAX_UNUSED_DAYS,
 )
 from .report_generator import ReportGenerator
+from .audit import get_audit_logger
+
+_AUDIT_CONTEXT = {
+    "entry_id": None,
+    "action": None,
+    "command": None,
+    "params": None,
+    "start_time": None,
+    "finalized": False,
+    "last_exit_code": 0,
+    "last_error": None,
+}
+console = Console()
+
+
+def cli_exit(code: int = 0, error: Optional[str] = None) -> None:
+    _AUDIT_CONTEXT["last_exit_code"] = code
+    if error and code != 0:
+        _AUDIT_CONTEXT["last_error"] = error
+    elif code != 0:
+        _AUDIT_CONTEXT["last_error"] = f"exit code {code}"
+    raise typer.Exit(code=code)
+
+
+def _build_audit_command(ctx: typer.Context) -> str:
+    parts = [ctx.info_name]
+    protected = getattr(ctx, "protected_args", None) or getattr(ctx, "_protected_args", None) or []
+    if protected:
+        parts.extend([shlex.quote(str(a)) for a in protected])
+    elif ctx.args:
+        parts.extend([shlex.quote(str(a)) for a in ctx.args])
+    return " ".join(parts)
+
+
+def _finalize_audit(success: bool = True, result: Optional[dict] = None, error: Optional[str] = None):
+    if not _AUDIT_CONTEXT.get("entry_id"):
+        return
+
+    if _AUDIT_CONTEXT.get("finalized"):
+        return
+
+    _AUDIT_CONTEXT["finalized"] = True
+
+    storage = get_storage()
+    logger = get_audit_logger(storage.base_dir)
+
+    status = "success" if success else "failure"
+    audit_result: dict = {"duration_ms": 0}
+    if _AUDIT_CONTEXT.get("start_time"):
+        duration = (utcnow() - _AUDIT_CONTEXT["start_time"]).total_seconds() * 1000
+        audit_result["duration_ms"] = int(duration)
+    if result:
+        audit_result.update(result)
+
+    logger.log(
+        action=_AUDIT_CONTEXT.get("action"),
+        status=status,
+        command=_AUDIT_CONTEXT.get("command"),
+        params=_AUDIT_CONTEXT.get("params"),
+        result=audit_result if success else None,
+        error=error,
+        parent_id=_AUDIT_CONTEXT.get("entry_id"),
+    )
+
+
+def _audit_callback(
+    ctx: typer.Context,
+    operator: Optional[str] = typer.Option(
+        None,
+        "--operator",
+        envvar="ACCESS_REVIEW_OPERATOR",
+        help="操作人标识 (可通过 ACCESS_REVIEW_OPERATOR 环境变量设置)",
+    ),
+):
+    """权限复核辅助命令行工具 - 全局选项"""
+    if operator:
+        os.environ["ACCESS_REVIEW_OPERATOR"] = operator
+
+    if ctx.invoked_subcommand is None:
+        return
+
+    storage = get_storage()
+    logger = get_audit_logger(storage.base_dir)
+
+    full_command_parts = []
+    c = ctx
+    while c is not None:
+        if c.info_name and c.info_name not in full_command_parts:
+            full_command_parts.insert(0, c.info_name)
+        c = c.parent
+    command_base = " ".join(full_command_parts)
+
+    arg_values = sys.argv[1:] if hasattr(sys, "argv") and len(sys.argv) > 1 else []
+    command_str = command_base
+    if arg_values:
+        command_str = command_base + " " + " ".join(
+            shlex.quote(str(a)) for a in arg_values
+        )
+
+    action = ctx.invoked_subcommand or ctx.command.name
+
+    params: dict = {}
+    cur_ctx = ctx
+    while cur_ctx is not None:
+        if cur_ctx.params:
+            for k, v in cur_ctx.params.items():
+                if k in ("operator", "help"):
+                    continue
+                if k in params:
+                    continue
+                if isinstance(v, Path):
+                    params[k] = str(v)
+                elif isinstance(v, (str, int, float, bool, list, dict)) or v is None:
+                    try:
+                        json.dumps(v)
+                        params[k] = v
+                    except (TypeError, ValueError):
+                        params[k] = str(v)
+                else:
+                    params[k] = str(v)
+        cur_ctx = None
+
+    entry_id = logger.log(
+        action=action,
+        status="started",
+        command=command_str,
+        params=params,
+    )
+
+    _AUDIT_CONTEXT.update({
+        "entry_id": entry_id,
+        "action": action,
+        "command": command_str,
+        "params": params,
+        "start_time": utcnow(),
+    })
+
+    def _on_close():
+        success = True
+        err = None
+        last_code = _AUDIT_CONTEXT.get("last_exit_code", 0)
+        last_err = _AUDIT_CONTEXT.get("last_error")
+        if hasattr(ctx, "_audit_exit_code"):
+            last_code = ctx._audit_exit_code
+        if hasattr(ctx, "_audit_error") and ctx._audit_error:
+            last_err = ctx._audit_error
+        if last_code != 0:
+            success = False
+        if last_err:
+            err = last_err
+        _finalize_audit(success=success, error=err)
+
+    ctx.call_on_close(_on_close)
+
 
 app = typer.Typer(
     help="权限复核辅助命令行工具 - 帮助安全团队进行用户权限审计、复核和异常检测",
     no_args_is_help=True,
     add_completion=False,
+    callback=_audit_callback,
 )
-console = Console()
 
 
 def get_storage() -> Storage:
@@ -54,11 +211,9 @@ def check_enum_value(param_name: str, value: Optional[str], enum_cls) -> Optiona
         return enum_cls(normalized)
     except ValueError:
         valid = ", ".join(e.value for e in enum_cls)
-        console.print(
-            f"[red]✗[/red] 参数 --{param_name} 的值 '{value}' 非法，"
-            f"允许的值为: {valid}"
-        )
-        raise typer.Exit(1)
+        err_msg = f"参数 --{param_name} 的值 '{value}' 非法，允许的值为: {valid}"
+        console.print(f"[red]✗[/red] {err_msg}")
+        cli_exit(1, error=err_msg)
 
 
 def check_positive_int(
@@ -72,16 +227,14 @@ def check_positive_int(
             range_str = f"范围 [{min_val}, {max_val}]"
         else:
             range_str = f"最小为 {min_val}"
-        console.print(
-            f"[red]✗[/red] 参数 --{param_name} 的值 {value} 超出允许{range_str}"
-        )
-        raise typer.Exit(1)
+        err_msg = f"参数 --{param_name} 的值 {value} 超出允许{range_str}"
+        console.print(f"[red]✗[/red] {err_msg}")
+        cli_exit(1, error=err_msg)
     if max_val is not None and value > max_val:
         range_str = f"范围 [{min_val or 0}, {max_val}]"
-        console.print(
-            f"[red]✗[/red] 参数 --{param_name} 的值 {value} 超出允许{range_str}"
-        )
-        raise typer.Exit(1)
+        err_msg = f"参数 --{param_name} 的值 {value} 超出允许{range_str}"
+        console.print(f"[red]✗[/red] {err_msg}")
+        cli_exit(1, error=err_msg)
     return value
 
 
@@ -90,11 +243,9 @@ def check_data_type(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     if value not in allowed:
-        console.print(
-            f"[red]✗[/red] 参数 --type 的值 '{value}' 非法，"
-            f"允许的值为: {', '.join(sorted(allowed))}"
-        )
-        raise typer.Exit(1)
+        err_msg = f"参数 --type 的值 '{value}' 非法，允许的值为: {', '.join(sorted(allowed))}"
+        console.print(f"[red]✗[/red] {err_msg}")
+        cli_exit(1, error=err_msg)
     return value
 
 
@@ -153,6 +304,7 @@ def import_permissions(
     file_path: Path = typer.Argument(..., help="JSON 文件路径"),
     overwrite: bool = typer.Option(False, "--overwrite", "-o", help="是否覆盖已存在的记录"),
     dedupe: bool = typer.Option(True, "--dedupe/--no-dedupe", help="是否按(username, resource, role)业务键去重合并"),
+    cross_ou: bool = typer.Option(True, "--cross-ou/--no-cross-ou", help="是否启用跨OU/子组织身份归一化（优先用email识别同一用户）"),
 ):
     """从 JSON 文件导入用户权限清单"""
     storage = get_storage()
@@ -163,7 +315,12 @@ def import_permissions(
     ) as progress:
         task = progress.add_task("正在导入权限数据...", total=None)
         try:
-            counts = storage.import_from_json(file_path, overwrite=overwrite, dedupe=dedupe)
+            counts = storage.import_from_json(
+                file_path,
+                overwrite=overwrite,
+                dedupe=dedupe,
+                cross_ou=cross_ou,
+            )
             progress.update(task, completed=True)
         except Exception as e:
             console.print(f"[red]✗[/red] 导入失败: {e}")
@@ -176,6 +333,7 @@ def import_permissions(
         "anomalies": "异常报告",
         "cycles": "复核周期",
         "duplicates_merged": "重复合并",
+        "cross_ou_merged": "跨OU合并",
     }
     for key, value in counts.items():
         if isinstance(value, int) and value > 0:
@@ -943,7 +1101,8 @@ def user_report(
 @report_app.command("aggregate")
 def aggregate_report(
     group_by: str = typer.Option("department", "--group-by", "-g", help="聚合维度: user/role/department"),
-    output_path: Optional[Path] = typer.Option(None, "--output", "-o", help="输出 JSON 文件路径"),
+    output_path: Optional[Path] = typer.Option(None, "--output", "-o", help="输出文件路径"),
+    format: str = typer.Option("json", "--format", "-f", help="输出格式: json/csv/excel"),
     limit: int = typer.Option(20, "--limit", "-n", help="显示分组数量 (按权限数降序)"),
     show_details: bool = typer.Option(False, "--details", "-d", help="是否显示每个分组下的权限明细"),
 ):
@@ -1074,9 +1233,35 @@ def aggregate_report(
             console.print()
 
     if output_path:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        console.print(f"[green]✓[/green] 报告已保存到: {output_path}")
+        format_normalized = format.lower()
+        allowed_formats = {"json", "csv", "excel"}
+        if format_normalized not in allowed_formats:
+            console.print(
+                f"[red]✗[/red] 参数 --format 的值 '{format}' 非法，"
+                f"允许的值为: {', '.join(sorted(allowed_formats))}"
+            )
+            raise typer.Exit(1)
+
+        try:
+            if format_normalized == "json":
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2, ensure_ascii=False)
+                saved = f"报告已保存到: {output_path}"
+                count = report["total_groups"]
+            elif format_normalized == "csv":
+                count = report_gen.export_aggregate_csv(report, output_path)
+                saved = f"CSV 报告已保存到: {output_path}"
+            else:
+                count = report_gen.export_aggregate_excel(report, output_path)
+                saved = f"Excel 报告已保存到: {output_path}"
+        except ImportError as e:
+            console.print(f"[red]✗[/red] {e}")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"[red]✗[/red] 导出失败: {e}")
+            raise typer.Exit(1)
+
+        console.print(f"[green]✓[/green] {saved}（{count} 条记录）")
 
 
 @app.command()
@@ -1184,5 +1369,120 @@ def quarterly(
     console.print(f"  4. 导出收回清单执行收回: access-review report revoke revoke_final.csv")
 
 
+audit_app = typer.Typer(help="审计日志查询")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("list")
+def list_audit_logs(
+    action: Optional[str] = typer.Option(None, "--action", "-a", help="按操作类型筛选"),
+    operator: Optional[str] = typer.Option(None, "--operator", "-u", help="按操作人筛选"),
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="按状态筛选: started/success/failure"),
+    start_date: Optional[str] = typer.Option(None, "--start", help="起始日期 YYYY-MM-DD"),
+    end_date: Optional[str] = typer.Option(None, "--end", help="结束日期 YYYY-MM-DD"),
+    limit: int = typer.Option(50, "--limit", "-n", help="显示条数"),
+):
+    """查询审计日志"""
+    storage = get_storage()
+    logger = get_audit_logger(storage.base_dir)
+
+    status_normalized = None
+    if status:
+        status_lower = status.lower()
+        if status_lower not in {"started", "success", "failure"}:
+            console.print(
+                f"[red]✗[/red] 参数 --status 的值 '{status}' 非法，"
+                f"允许的值为: started, success, failure"
+            )
+            raise typer.Exit(1)
+        status_normalized = status_lower
+
+    limit = check_positive_int("limit", limit, min_val=1, max_val=5000)
+
+    entries = logger.query(
+        action=action,
+        operator=operator,
+        status=status_normalized,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+    )
+
+    if not entries:
+        console.print("[yellow]![/yellow] 没有找到符合条件的审计日志")
+        return
+
+    table = Table(title=f"审计日志 (共 {len(entries)} 条)")
+    table.add_column("时间", style="dim")
+    table.add_column("操作", style="cyan")
+    table.add_column("状态", style="bold")
+    table.add_column("操作人", style="magenta")
+    table.add_column("命令", style="dim")
+
+    for e in entries:
+        status_style = "green" if e.get("status") == "success" else "red" if e.get("status") == "failure" else "yellow"
+        timestamp = e.get("timestamp", "")
+        if "T" in timestamp:
+            timestamp = timestamp.replace("T", " ")[:19]
+        table.add_row(
+            timestamp,
+            e.get("action", ""),
+            f"[{status_style}]{e.get('status', '')}[/{status_style}]",
+            e.get("operator", ""),
+            (e.get("command") or "")[:60],
+        )
+
+    console.print(table)
+    log_dir = logger.audit_dir
+    console.print(f"[dim]💡 日志存放位置: {log_dir}/[/dim]")
+
+
+@audit_app.command("show")
+def show_audit_log(
+    log_id: str = typer.Argument(..., help="审计日志 ID"),
+):
+    """查看单条审计日志详情"""
+    storage = get_storage()
+    logger = get_audit_logger(storage.base_dir)
+    entries = logger.query(limit=10000)
+
+    target = None
+    for e in entries:
+        if e.get("id") == log_id or e.get("parent_id") == log_id or (e.get("id", "").startswith(log_id) and len(log_id) >= 8):
+            target = e
+            break
+        if log_id in str(e.get("id", "")):
+            target = e
+            break
+
+    if not target:
+        console.print(f"[red]✗[/red] 未找到审计日志: {log_id}")
+        raise typer.Exit(1)
+
+    output = json.dumps(target, indent=2, ensure_ascii=False, sort_keys=True)
+    rprint(Panel(output, title=f"审计日志 {target['id'][:8]}", border_style="cyan"))
+
+
 if __name__ == "__main__":
-    app()
+    atexit.register(lambda: _finalize_audit(success=True))
+    _last_exit_code = 0
+    try:
+        app()
+    except typer.Exit as exc:
+        _last_exit_code = exc.exit_code if isinstance(exc.exit_code, int) else 0
+        raise
+    except SystemExit as exc:
+        _last_exit_code = exc.code if isinstance(exc.code, int) else 0
+        raise
+    except Exception as exc:
+        _last_exit_code = 1
+        _finalize_audit(success=False, error=str(exc))
+        raise
+    finally:
+        try:
+            from click import get_current_context
+            _ctx = get_current_context()
+            if _ctx is not None:
+                _ctx._audit_exit_code = _last_exit_code
+        except Exception:
+            pass
